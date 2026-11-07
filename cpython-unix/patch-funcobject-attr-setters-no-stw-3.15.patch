@@ -1,0 +1,753 @@
+Backport of https://github.com/python/cpython/pull/159725 ([3.15] gh-159136),
+merged to the 3.15 branch on 2026-10-29 and first shipped in 3.15.3. On the
+free-threaded build, setting a function's __name__/__qualname__/__module__/__doc__
+stopped the world since 3.14.7 (gh-154826/gh-154851), so functools.wraps() from
+several threads ran hundreds of times slower. The fix uses the per-object critical
+section plus _PyObject_XSetRefDelayed(), like the generator __name__ setter.
+Documentation and NEWS hunks dropped. Remove when cpython-3.15 is >= 3.15.3.
+
+diff --git a/Include/cpython/funcobject.h b/Include/cpython/funcobject.h
+index 765dd969c83c767..78a4ed41162924f 100644
+--- a/Include/cpython/funcobject.h
++++ b/Include/cpython/funcobject.h
+@@ -98,7 +98,12 @@ static inline PyObject* PyFunction_GET_GLOBALS(PyObject *func) {
+ #define PyFunction_GET_GLOBALS(func) PyFunction_GET_GLOBALS(_PyObject_CAST(func))
+ 
+ static inline PyObject* PyFunction_GET_MODULE(PyObject *func) {
++#ifdef Py_GIL_DISABLED
++    return (PyObject *)_Py_atomic_load_ptr_acquire(
++        &_PyFunction_CAST(func)->func_module);
++#else
+     return _PyFunction_CAST(func)->func_module;
++#endif
+ }
+ #define PyFunction_GET_MODULE(func) PyFunction_GET_MODULE(_PyObject_CAST(func))
+ 
+@@ -118,7 +123,12 @@ static inline PyObject* PyFunction_GET_CLOSURE(PyObject *func) {
+ #define PyFunction_GET_CLOSURE(func) PyFunction_GET_CLOSURE(_PyObject_CAST(func))
+ 
+ static inline PyObject* PyFunction_GET_ANNOTATIONS(PyObject *func) {
++#ifdef Py_GIL_DISABLED
++    return (PyObject *)_Py_atomic_load_ptr_acquire(
++        &_PyFunction_CAST(func)->func_annotations);
++#else
+     return _PyFunction_CAST(func)->func_annotations;
++#endif
+ }
+ #define PyFunction_GET_ANNOTATIONS(func) PyFunction_GET_ANNOTATIONS(_PyObject_CAST(func))
+ 
+diff --git a/Lib/test/test_capi/test_function.py b/Lib/test/test_capi/test_function.py
+index c1a278e5d4da916..9a07e3106f3a22a 100644
+--- a/Lib/test/test_capi/test_function.py
++++ b/Lib/test/test_capi/test_function.py
+@@ -44,6 +44,12 @@ def some():
+         with self.assertRaises(SystemError):
+             _testcapi.function_get_module(None)  # not a function
+ 
++        self.assertEqual(_testcapi.function_get_module_macro(some), module)
++        value = object()
++        some.__module__ = value
++        self.assertIs(_testcapi.function_get_module(some), value)
++        self.assertIs(_testcapi.function_get_module_macro(some), value)
++
+     def test_function_get_defaults(self):
+         # Test PyFunction_GetDefaults()
+         def some(
+diff --git a/Lib/test/test_free_threading/test_functions.py b/Lib/test/test_free_threading/test_functions.py
+index 7a59638d27dc9d4..1874922d424db8b 100644
+--- a/Lib/test/test_free_threading/test_functions.py
++++ b/Lib/test/test_free_threading/test_functions.py
+@@ -81,6 +81,123 @@ def set_annotate():
+         threading_helper.run_concurrently(
+             [set_annotations, set_annotate] * (NUM_THREADS // 2))
+ 
++    def test_read_while_replacing_name_attrs(self):
++        # Readers load __name__, __qualname__, __doc__ and __module__
++        # without holding a lock. A writer thread replacing them must not
++        # free a value a reader thread is about to incref.
++        def target():
++            yield
++
++        def writer():
++            for _ in range(ITERS):
++                target.__name__ = random_string()
++                target.__qualname__ = random_string()
++                target.__doc__ = random_string()
++                target.__module__ = random_string()
++
++        def reader():
++            for _ in range(ITERS):
++                target.__name__
++                target.__qualname__
++                target.__doc__
++                target.__module__
++                # make_gen() copies __name__ and __qualname__.
++                gen = target()
++                gen.__name__
++                gen.__qualname__
++                gen.close()
++
++        threading_helper.run_concurrently(
++            [writer, reader] * (NUM_THREADS // 2))
++
++    def test_repr_while_replacing_qualname(self):
++        def target():
++            pass
++
++        def writer():
++            for _ in range(ITERS):
++                target.__qualname__ = random_string()
++
++        def reader():
++            for _ in range(ITERS):
++                self.assertRegex(repr(target), r"^<function .* at 0x[0-9a-fA-F]+>$")
++
++        threading_helper.run_concurrently(
++            [writer, reader] * (NUM_THREADS // 2))
++
++    def test_c_api_read_while_replacing_module(self):
++        from test.support import import_helper
++        _testcapi = import_helper.import_module('_testcapi')
++
++        def target():
++            pass
++
++        def writer():
++            for _ in range(ITERS):
++                target.__module__ = random_string()
++                target.__module__ = object()
++                target.__module__ = None
++
++        def reader():
++            for _ in range(ITERS):
++                for get_module in (_testcapi.function_get_module,
++                                   _testcapi.function_get_module_macro):
++                    value = get_module(target)
++                    self.assertIn(type(value), (str, object, type(None)))
++
++        threading_helper.run_concurrently(
++            [writer, reader] * (NUM_THREADS // 2))
++
++    def test_c_api_read_while_replacing_name(self):
++        from test.support import import_helper
++        _testlimitedcapi = import_helper.import_module('_testlimitedcapi')
++
++        def target():
++            pass
++
++        def writer():
++            for _ in range(ITERS):
++                # Non-ASCII names exercise lazy UTF-8 conversion.
++                target.__name__ = 'name_\u03bb' + random_string()
++
++        def reader():
++            for _ in range(ITERS):
++                name = _testlimitedcapi.eval_get_func_name(target)
++                self.assertIsInstance(name, str)
++
++        threading_helper.run_concurrently(
++            [writer, reader] * (NUM_THREADS // 2))
++
++    def test_argument_errors_while_replacing_qualname(self):
++        def target(x, *, y):
++            pass
++
++        def posonly(x, /):
++            pass
++
++        calls = (
++            lambda: target(),
++            lambda: target(1),
++            lambda: target(1, 2),
++            lambda: target(1, x=2),
++            lambda: target(1, extra=2),
++            lambda: posonly(x=1),
++        )
++
++        def writer():
++            for _ in range(ITERS):
++                target.__qualname__ = random_string()
++                posonly.__qualname__ = random_string()
++
++        def reader():
++            for _ in range(ITERS):
++                for call in calls:
++                    with self.assertRaises(TypeError):
++                        call()
++
++        threading_helper.run_concurrently(
++            [writer, reader] * (NUM_THREADS // 2))
++
+     def test_call_while_replacing_defaults(self):
+         # The eval loop reads __defaults__ and __kwdefaults__ without holding
+         # a lock while pushing a frame.
+diff --git a/Lib/test/test_funcattrs.py b/Lib/test/test_funcattrs.py
+index b2fa10d74580125..8b98d901adf0be5 100644
+--- a/Lib/test/test_funcattrs.py
++++ b/Lib/test/test_funcattrs.py
+@@ -1,8 +1,10 @@
++import gc
+ import textwrap
+ import types
+ import typing
+ import unittest
+ import warnings
++import weakref
+ from test import support
+ 
+ 
+@@ -50,6 +52,35 @@ class FunctionPropertiesTest(FuncAttrsTest):
+     def test_module(self):
+         self.assertEqual(self.b.__module__, __name__)
+ 
++    def test_qualname_replaced_during_argument_error(self):
++        class Qualname(str):
++            pass
++
++        def target(x, /):
++            pass
++
++        target.__qualname__ = Qualname('original_qualname')
++        ref = weakref.ref(target.__qualname__)
++
++        class Keyword(str):
++            __hash__ = str.__hash__
++
++            def __eq__(self, other):
++                # Replacing and freeing the qualname while comparisons
++                # execute Python must not leave a dangling pointer.
++                target.__qualname__ = 'new_qualname'
++                gc.collect()
++                return True
++
++        with self.assertRaisesRegex(
++            TypeError,
++            r"new_qualname\(\) got some positional-only arguments "
++            r"passed as keyword arguments: 'x'",
++        ):
++            target(**{Keyword('x'): 1})
++        gc.collect()
++        self.assertIsNone(ref())
++
+     def test_dir_includes_correct_attrs(self):
+         self.b.known_attr = 7
+         self.assertIn('known_attr', dir(self.b),
+diff --git a/Modules/_testcapi/function.c b/Modules/_testcapi/function.c
+index 40767adbd3f14a7..28420ce19f112e9 100644
+--- a/Modules/_testcapi/function.c
++++ b/Modules/_testcapi/function.c
+@@ -38,6 +38,13 @@ function_get_module(PyObject *self, PyObject *func)
+ }
+ 
+ 
++static PyObject *
++function_get_module_macro(PyObject *self, PyObject *func)
++{
++    return Py_XNewRef(PyFunction_GET_MODULE(func));
++}
++
++
+ static PyObject *
+ function_get_defaults(PyObject *self, PyObject *func)
+ {
+@@ -134,6 +141,7 @@ static PyMethodDef test_methods[] = {
+     {"function_get_code", function_get_code, METH_O, NULL},
+     {"function_get_globals", function_get_globals, METH_O, NULL},
+     {"function_get_module", function_get_module, METH_O, NULL},
++    {"function_get_module_macro", function_get_module_macro, METH_O, NULL},
+     {"function_get_defaults", function_get_defaults, METH_O, NULL},
+     {"function_set_defaults", function_set_defaults, METH_VARARGS, NULL},
+     {"function_get_kw_defaults", function_get_kw_defaults, METH_O, NULL},
+diff --git a/Modules/_testinternalcapi.c b/Modules/_testinternalcapi.c
+index 56a67965a5d061b..94f484190c7fa55 100644
+--- a/Modules/_testinternalcapi.c
++++ b/Modules/_testinternalcapi.c
+@@ -1142,7 +1142,9 @@ record_eval(PyThreadState *tstate, struct _PyInterpreterFrame *f, int exc)
+         assert(module != NULL);
+         module_state *state = get_module_state(module);
+         Py_DECREF(module);
+-        int res = PyList_Append(state->record_list, func->func_name);
++        PyObject *name = Py_NewRef(FT_ATOMIC_LOAD_PTR_ACQUIRE(func->func_name));
++        int res = PyList_Append(state->record_list, name);
++        Py_DECREF(name);
+         if (res < 0) {
+             return NULL;
+         }
+@@ -1203,7 +1205,9 @@ record_eval_interp(PyThreadState *tstate, struct _PyInterpreterFrame *f, int exc
+         assert(module != NULL);
+         module_state *state = get_module_state(module);
+         Py_DECREF(module);
+-        int res = PyList_Append(state->record_list, func->func_name);
++        PyObject *name = Py_NewRef(FT_ATOMIC_LOAD_PTR_ACQUIRE(func->func_name));
++        int res = PyList_Append(state->record_list, name);
++        Py_DECREF(name);
+         if (res < 0) {
+             return NULL;
+         }
+diff --git a/Objects/funcobject.c b/Objects/funcobject.c
+index 9cac2e77845a4f8..252b7d300b34383 100644
+--- a/Objects/funcobject.c
++++ b/Objects/funcobject.c
+@@ -41,7 +41,8 @@ notify_func_watchers(PyInterpreterState *interp, PyFunction_WatchEvent event,
+             if (cb(event, func, new_value) < 0) {
+                 PyErr_FormatUnraisable(
+                     "Exception ignored in %s watcher callback for function %U at %p",
+-                    func_event_name(event), func->func_qualname, func);
++                    func_event_name(event),
++                    FT_ATOMIC_LOAD_PTR_ACQUIRE(func->func_qualname), func);
+             }
+         }
+         i++;
+@@ -405,7 +406,7 @@ PyFunction_GetModule(PyObject *op)
+         PyErr_BadInternalCall();
+         return NULL;
+     }
+-    return ((PyFunctionObject *) op) -> func_module;
++    return PyFunction_GET_MODULE(op);
+ }
+ 
+ PyObject *
+@@ -535,9 +536,29 @@ PyFunction_SetClosure(PyObject *op, PyObject *closure)
+     return 0;
+ }
+ 
++static void
++func_set_annotations_and_annotate(PyFunctionObject *op, PyObject *annotations,
++                                  PyObject *annotate)
++{
++    _Py_CRITICAL_SECTION_ASSERT_OBJECT_LOCKED(op);
++    // Care is needed, finalizers can run when references are dropped.  Store
++    // both new values before dropping references to the old.
++    PyObject *old_annotations = op->func_annotations;
++    PyObject *old_annotate = op->func_annotate;
++    FT_ATOMIC_STORE_PTR_RELEASE(op->func_annotations, annotations);
++    FT_ATOMIC_STORE_PTR_RELEASE(op->func_annotate, annotate);
++    if (old_annotations != NULL && !_Py_IsImmortal(old_annotations)) {
++        _PyObject_XDecRefDelayed(old_annotations);
++    }
++    if (old_annotate != NULL && !_Py_IsImmortal(old_annotate)) {
++        _PyObject_XDecRefDelayed(old_annotate);
++    }
++}
++
+ static PyObject *
+ func_get_annotation_dict(PyFunctionObject *op)
+ {
++    _Py_CRITICAL_SECTION_ASSERT_OBJECT_LOCKED(op);
+     if (op->func_annotations == NULL) {
+         if (op->func_annotate == NULL || !PyCallable_Check(op->func_annotate)) {
+             Py_RETURN_NONE;
+@@ -554,7 +575,7 @@ func_get_annotation_dict(PyFunctionObject *op)
+             Py_DECREF(ann_dict);
+             return NULL;
+         }
+-        Py_XSETREF(op->func_annotations, ann_dict);
++        _PyObject_XSetRefDelayed(&op->func_annotations, ann_dict);
+         return ann_dict;
+     }
+     if (PyTuple_CheckExact(op->func_annotations)) {
+@@ -576,7 +597,7 @@ func_get_annotation_dict(PyFunctionObject *op)
+                 return NULL;
+             }
+         }
+-        Py_SETREF(op->func_annotations, ann_dict);
++        _PyObject_XSetRefDelayed(&op->func_annotations, ann_dict);
+     }
+     assert(PyDict_Check(op->func_annotations));
+     return op->func_annotations;
+@@ -589,7 +610,11 @@ PyFunction_GetAnnotations(PyObject *op)
+         PyErr_BadInternalCall();
+         return NULL;
+     }
+-    return func_get_annotation_dict((PyFunctionObject *)op);
++    PyObject *d;
++    Py_BEGIN_CRITICAL_SECTION(op);
++    d = func_get_annotation_dict((PyFunctionObject *)op);
++    Py_END_CRITICAL_SECTION();
++    return d;
+ }
+ 
+ int
+@@ -610,15 +635,9 @@ PyFunction_SetAnnotations(PyObject *op, PyObject *annotations)
+         return -1;
+     }
+     PyFunctionObject *func = (PyFunctionObject *)op;
+-    PyInterpreterState *interp = _PyInterpreterState_GET();
+-    _PyEval_StopTheWorld(interp);
+-    PyObject *old_annotations = func->func_annotations;
+-    func->func_annotations = annotations;
+-    PyObject *old_annotate = func->func_annotate;
+-    func->func_annotate = NULL;
+-    _PyEval_StartTheWorld(interp);
+-    Py_XDECREF(old_annotations);
+-    Py_XDECREF(old_annotate);
++    Py_BEGIN_CRITICAL_SECTION(func);
++    func_set_annotations_and_annotate(func, annotations, NULL);
++    Py_END_CRITICAL_SECTION();
+     return 0;
+ }
+ 
+@@ -673,11 +692,11 @@ func_set_code(PyObject *self, PyObject *value, void *Py_UNUSED(ignored))
+     Py_ssize_t nclosure = (op->func_closure == NULL ? 0 :
+                                         PyTuple_GET_SIZE(op->func_closure));
+     if (nclosure != nfree) {
++        PyObject *name = FT_ATOMIC_LOAD_PTR_ACQUIRE(op->func_name);
+         PyErr_Format(PyExc_ValueError,
+                      "%U() requires a code object with %zd free vars,"
+                      " not %d",
+-                     op->func_name,
+-                     nclosure, nfree);
++                     name, nclosure, nfree);
+         return -1;
+     }
+ 
+@@ -709,7 +728,8 @@ static PyObject *
+ func_get_name(PyObject *self, void *Py_UNUSED(ignored))
+ {
+     PyFunctionObject *op = _PyFunction_CAST(self);
+-    return Py_NewRef(op->func_name);
++    PyObject *name = FT_ATOMIC_LOAD_PTR_ACQUIRE(op->func_name);
++    return Py_NewRef(name);
+ }
+ 
+ static int
+@@ -723,12 +743,9 @@ func_set_name(PyObject *self, PyObject *value, void *Py_UNUSED(ignored))
+                         "__name__ must be set to a string object");
+         return -1;
+     }
+-    PyInterpreterState *interp = _PyInterpreterState_GET();
+-    _PyEval_StopTheWorld(interp);
+-    PyObject *old_name = op->func_name;
+-    op->func_name = Py_NewRef(value);
+-    _PyEval_StartTheWorld(interp);
+-    Py_XDECREF(old_name);
++    Py_BEGIN_CRITICAL_SECTION(op);
++    _PyObject_XSetRefDelayed(&op->func_name, Py_NewRef(value));
++    Py_END_CRITICAL_SECTION();
+     return 0;
+ }
+ 
+@@ -736,7 +753,8 @@ static PyObject *
+ func_get_qualname(PyObject *self, void *Py_UNUSED(ignored))
+ {
+     PyFunctionObject *op = _PyFunction_CAST(self);
+-    return Py_NewRef(op->func_qualname);
++    PyObject *qualname = FT_ATOMIC_LOAD_PTR_ACQUIRE(op->func_qualname);
++    return Py_NewRef(qualname);
+ }
+ 
+ static int
+@@ -751,12 +769,9 @@ func_set_qualname(PyObject *self, PyObject *value, void *Py_UNUSED(ignored))
+         return -1;
+     }
+     handle_func_event(PyFunction_EVENT_MODIFY_QUALNAME, (PyFunctionObject *) op, value);
+-    PyInterpreterState *interp = _PyInterpreterState_GET();
+-    _PyEval_StopTheWorld(interp);
+-    PyObject *old_qualname = op->func_qualname;
+-    op->func_qualname = Py_NewRef(value);
+-    _PyEval_StartTheWorld(interp);
+-    Py_XDECREF(old_qualname);
++    Py_BEGIN_CRITICAL_SECTION(op);
++    _PyObject_XSetRefDelayed(&op->func_qualname, Py_NewRef(value));
++    Py_END_CRITICAL_SECTION();
+     return 0;
+ }
+ 
+@@ -764,7 +779,7 @@ static PyObject *
+ func_get_doc(PyObject *self, void *Py_UNUSED(ignored))
+ {
+     PyFunctionObject *op = _PyFunction_CAST(self);
+-    PyObject *doc = op->func_doc;
++    PyObject *doc = FT_ATOMIC_LOAD_PTR_ACQUIRE(op->func_doc);
+     if (doc == NULL) {
+         doc = Py_None;
+     }
+@@ -776,12 +791,9 @@ func_set_doc(PyObject *self, PyObject *value, void *Py_UNUSED(ignored))
+ {
+     /* Legal to del f.__doc__ or to set it to any object. */
+     PyFunctionObject *op = _PyFunction_CAST(self);
+-    PyInterpreterState *interp = _PyInterpreterState_GET();
+-    _PyEval_StopTheWorld(interp);
+-    PyObject *old_doc = op->func_doc;
+-    op->func_doc = Py_XNewRef(value);
+-    _PyEval_StartTheWorld(interp);
+-    Py_XDECREF(old_doc);
++    Py_BEGIN_CRITICAL_SECTION(op);
++    _PyObject_XSetRefDelayed(&op->func_doc, Py_XNewRef(value));
++    Py_END_CRITICAL_SECTION();
+     return 0;
+ }
+ 
+@@ -789,7 +801,7 @@ static PyObject *
+ func_get_module(PyObject *self, void *Py_UNUSED(ignored))
+ {
+     PyFunctionObject *op = _PyFunction_CAST(self);
+-    PyObject *module = op->func_module;
++    PyObject *module = FT_ATOMIC_LOAD_PTR_ACQUIRE(op->func_module);
+     if (module == NULL) {
+         module = Py_None;
+     }
+@@ -801,12 +813,9 @@ func_set_module(PyObject *self, PyObject *value, void *Py_UNUSED(ignored))
+ {
+     /* Legal to del f.__module__ or to set it to any object. */
+     PyFunctionObject *op = _PyFunction_CAST(self);
+-    PyInterpreterState *interp = _PyInterpreterState_GET();
+-    _PyEval_StopTheWorld(interp);
+-    PyObject *old_module = op->func_module;
+-    op->func_module = Py_XNewRef(value);
+-    _PyEval_StartTheWorld(interp);
+-    Py_XDECREF(old_module);
++    Py_BEGIN_CRITICAL_SECTION(op);
++    _PyObject_XSetRefDelayed(&op->func_module, Py_XNewRef(value));
++    Py_END_CRITICAL_SECTION();
+     return 0;
+ }
+ 
+@@ -940,12 +949,11 @@ function___annotate___set_impl(PyFunctionObject *self, PyObject *value)
+         return -1;
+     }
+     if (Py_IsNone(value)) {
+-        Py_XSETREF(self->func_annotate, Py_NewRef(value));
++        _PyObject_XSetRefDelayed(&self->func_annotate, Py_NewRef(value));
+         return 0;
+     }
+     else if (PyCallable_Check(value)) {
+-        Py_XSETREF(self->func_annotate, Py_NewRef(value));
+-        Py_CLEAR(self->func_annotations);
++        func_set_annotations_and_annotate(self, NULL, Py_NewRef(value));
+         return 0;
+     }
+     else {
+@@ -970,9 +978,10 @@ function___annotations___get_impl(PyFunctionObject *self)
+     PyObject *d = NULL;
+     if (self->func_annotations == NULL &&
+         (self->func_annotate == NULL || !PyCallable_Check(self->func_annotate))) {
+-        self->func_annotations = PyDict_New();
+-        if (self->func_annotations == NULL)
++        PyObject *ann_dict = PyDict_New();
++        if (ann_dict == NULL)
+             return NULL;
++        FT_ATOMIC_STORE_PTR_RELEASE(self->func_annotations, ann_dict);
+     }
+     d = func_get_annotation_dict(self);
+     return Py_XNewRef(d);
+@@ -999,8 +1008,7 @@ function___annotations___set_impl(PyFunctionObject *self, PyObject *value)
+             "__annotations__ must be set to a dict object");
+         return -1;
+     }
+-    Py_XSETREF(self->func_annotations, Py_XNewRef(value));
+-    Py_CLEAR(self->func_annotate);
++    func_set_annotations_and_annotate(self, Py_XNewRef(value), NULL);
+     return 0;
+ }
+ 
+@@ -1237,8 +1245,8 @@ static PyObject*
+ func_repr(PyObject *self)
+ {
+     PyFunctionObject *op = _PyFunction_CAST(self);
+-    return PyUnicode_FromFormat("<function %U at %p>",
+-                                op->func_qualname, op);
++    PyObject *qualname = FT_ATOMIC_LOAD_PTR_ACQUIRE(op->func_qualname);
++    return PyUnicode_FromFormat("<function %U at %p>", qualname, op);
+ }
+ 
+ static int
+diff --git a/Objects/genobject.c b/Objects/genobject.c
+index 3cdc06733363d3e..c48c542ebbe7b20 100644
+--- a/Objects/genobject.c
++++ b/Objects/genobject.c
+@@ -1106,10 +1106,12 @@ make_gen(PyTypeObject *type, PyFunctionObject *func)
+     gen->gi_exc_state.exc_value = NULL;
+     gen->gi_exc_state.previous_item = NULL;
+     gen->gi_iframe.f_executable = PyStackRef_None;
+-    assert(func->func_name != NULL);
+-    gen->gi_name = Py_NewRef(func->func_name);
+-    assert(func->func_qualname != NULL);
+-    gen->gi_qualname = Py_NewRef(func->func_qualname);
++    PyObject *name = FT_ATOMIC_LOAD_PTR_ACQUIRE(func->func_name);
++    assert(name != NULL);
++    gen->gi_name = Py_NewRef(name);
++    PyObject *qualname = FT_ATOMIC_LOAD_PTR_ACQUIRE(func->func_qualname);
++    assert(qualname != NULL);
++    gen->gi_qualname = Py_NewRef(qualname);
+     _PyObject_GC_TRACK(gen);
+     return (PyObject *)gen;
+ }
+diff --git a/Python/ceval.c b/Python/ceval.c
+index ce397c120d46651..bf3b21f3f7911d9 100644
+--- a/Python/ceval.c
++++ b/Python/ceval.c
+@@ -1673,7 +1673,7 @@ too_many_positional(PyThreadState *tstate, PyCodeObject *co,
+ static int
+ positional_only_passed_as_keyword(PyThreadState *tstate, PyCodeObject *co,
+                                   Py_ssize_t kwcount, PyObject* kwnames,
+-                                  PyObject *qualname)
++                                  PyFunctionObject *func)
+ {
+     int posonly_conflicts = 0;
+     PyObject* posonly_names = PyList_New(0);
+@@ -1720,7 +1720,8 @@ positional_only_passed_as_keyword(PyThreadState *tstate, PyCodeObject *co,
+         _PyErr_Format(tstate, PyExc_TypeError,
+                       "%U() got some positional-only arguments passed"
+                       " as keyword arguments: '%U'",
+-                      qualname, error_names);
++                      FT_ATOMIC_LOAD_PTR_ACQUIRE(func->func_qualname),
++                      error_names);
+         Py_DECREF(error_names);
+         goto fail;
+     }
+@@ -1811,8 +1812,8 @@ initialize_locals(PyThreadState *tstate, PyFunctionObject *func,
+ 
+             if (keyword == NULL || !PyUnicode_Check(keyword)) {
+                 _PyErr_Format(tstate, PyExc_TypeError,
+-                            "%U() keywords must be strings",
+-                          func->func_qualname);
++                              "%U() keywords must be strings",
++                              FT_ATOMIC_LOAD_PTR_ACQUIRE(func->func_qualname));
+                 goto kw_fail;
+             }
+ 
+@@ -1844,7 +1845,7 @@ initialize_locals(PyThreadState *tstate, PyFunctionObject *func,
+                 if (co->co_posonlyargcount
+                     && positional_only_passed_as_keyword(tstate, co,
+                                                         kwcount, kwnames,
+-                                                        func->func_qualname))
++                                                        func))
+                 {
+                     goto kw_fail;
+                 }
+@@ -1865,15 +1866,16 @@ initialize_locals(PyThreadState *tstate, PyFunctionObject *func,
+                     }
+                 }
+ 
++                PyObject *qualname = FT_ATOMIC_LOAD_PTR_ACQUIRE(func->func_qualname);
+                 if (suggestion_keyword) {
+                     _PyErr_Format(tstate, PyExc_TypeError,
+                                 "%U() got an unexpected keyword argument '%S'. Did you mean '%S'?",
+-                                func->func_qualname, keyword, suggestion_keyword);
++                                qualname, keyword, suggestion_keyword);
+                     Py_DECREF(suggestion_keyword);
+                 } else {
+                     _PyErr_Format(tstate, PyExc_TypeError,
+                                 "%U() got an unexpected keyword argument '%S'",
+-                                func->func_qualname, keyword);
++                                qualname, keyword);
+                 }
+ 
+                 goto kw_fail;
+@@ -1894,8 +1896,9 @@ initialize_locals(PyThreadState *tstate, PyFunctionObject *func,
+         kw_found:
+             if (PyStackRef_AsPyObjectBorrow(localsplus[j]) != NULL) {
+                 _PyErr_Format(tstate, PyExc_TypeError,
+-                            "%U() got multiple values for argument '%S'",
+-                          func->func_qualname, keyword);
++                              "%U() got multiple values for argument '%S'",
++                              FT_ATOMIC_LOAD_PTR_ACQUIRE(func->func_qualname),
++                              keyword);
+                 goto kw_fail;
+             }
+             localsplus[j] = value_stackref;
+@@ -1905,7 +1908,7 @@ initialize_locals(PyThreadState *tstate, PyFunctionObject *func,
+     /* Check the number of positional arguments */
+     if ((argcount > co->co_argcount) && !(co->co_flags & CO_VARARGS)) {
+         too_many_positional(tstate, co, argcount, func->func_defaults, localsplus,
+-                            func->func_qualname);
++                            FT_ATOMIC_LOAD_PTR_ACQUIRE(func->func_qualname));
+         goto fail_post_args;
+     }
+ 
+@@ -1921,7 +1924,7 @@ initialize_locals(PyThreadState *tstate, PyFunctionObject *func,
+         }
+         if (missing) {
+             missing_arguments(tstate, co, missing, defcount, localsplus,
+-                              func->func_qualname);
++                              FT_ATOMIC_LOAD_PTR_ACQUIRE(func->func_qualname));
+             goto fail_post_args;
+         }
+         if (n > m)
+@@ -1960,7 +1963,7 @@ initialize_locals(PyThreadState *tstate, PyFunctionObject *func,
+         }
+         if (missing) {
+             missing_arguments(tstate, co, missing, -1, localsplus,
+-                              func->func_qualname);
++                              FT_ATOMIC_LOAD_PTR_ACQUIRE(func->func_qualname));
+             goto fail_post_args;
+         }
+     }
+@@ -2912,14 +2915,40 @@ PyEval_MergeCompilerFlags(PyCompilerFlags *cf)
+     return result;
+ }
+ 
++static const char *
++functionobject_get_name(PyFunctionObject *f)
++{
++#ifdef Py_GIL_DISABLED
++    for (;;) {
++        PyObject *name = Py_NewRef(FT_ATOMIC_LOAD_PTR_ACQUIRE(f->func_name));
++        // UTF-8 conversion may detach while acquiring the string's lock.
++        // This could result in func_name being freed if func_name was
++        // recently replaced using _PyObject_XSetRefDelayed().  The returned
++        // char* is only valid until the next quiescent point.
++        const char *result = PyUnicode_AsUTF8(name);
++        if (result == NULL) {
++            Py_DECREF(name);
++            return NULL;
++        }
++        int unchanged = name == FT_ATOMIC_LOAD_PTR_ACQUIRE(f->func_name);
++        Py_DECREF(name);
++        if (unchanged) {
++            return result;
++        }
++    }
++#else
++    return PyUnicode_AsUTF8(f->func_name);
++#endif
++}
+ 
+ const char *
+ PyEval_GetFuncName(PyObject *func)
+ {
+     if (PyMethod_Check(func))
+         return PyEval_GetFuncName(PyMethod_GET_FUNCTION(func));
+-    else if (PyFunction_Check(func))
+-        return PyUnicode_AsUTF8(((PyFunctionObject*)func)->func_name);
++    else if (PyFunction_Check(func)) {
++        return functionobject_get_name((PyFunctionObject *)func);
++    }
+     else if (PyCFunction_Check(func))
+         return ((PyCFunctionObject*)func)->m_ml->ml_name;
+     else
+diff --git a/Python/ceval.h b/Python/ceval.h
+index 0437ab85c5a6682..00db67265a4f3a1 100644
+--- a/Python/ceval.h
++++ b/Python/ceval.h
+@@ -257,9 +257,9 @@ lltrace_resume_frame(_PyInterpreterFrame *frame)
+     }
+     PyFunctionObject *f = (PyFunctionObject *)fobj;
+     PyObject *exc = PyErr_GetRaisedException();
+-    PyObject *name = f->func_qualname;
++    PyObject *name = Py_XNewRef(FT_ATOMIC_LOAD_PTR_ACQUIRE(f->func_qualname));
+     if (name == NULL) {
+-        name = f->func_name;
++        name = Py_XNewRef(FT_ATOMIC_LOAD_PTR_ACQUIRE(f->func_name));
+     }
+     printf("\nResuming frame");
+     if (name) {
+@@ -267,12 +267,15 @@ lltrace_resume_frame(_PyInterpreterFrame *frame)
+         if (PyObject_Print(name, stdout, 0) < 0) {
+             PyErr_Clear();
+         }
++        Py_DECREF(name);
+     }
+-    if (f->func_module) {
++    PyObject *module = Py_XNewRef(FT_ATOMIC_LOAD_PTR_ACQUIRE(f->func_module));
++    if (module) {
+         printf(" in module ");
+-        if (PyObject_Print(f->func_module, stdout, 0) < 0) {
++        if (PyObject_Print(module, stdout, 0) < 0) {
+             PyErr_Clear();
+         }
++        Py_DECREF(module);
+     }
+     printf("\n");
+     fflush(stdout);

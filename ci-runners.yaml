@@ -1,11 +1,14 @@
 # Describes the runners that the CI system can use
 
-depot-ubuntu-22.04-4:
+# Mckain-Cloud fork: no Depot runners here. GitHub-hosted labels stand in for the
+# non-free Linux runners (upstream: depot-ubuntu-22.04-4 / depot-ubuntu-22.04-arm-4)
+# so ci-matrix.py's free=False lookup still resolves for every target.
+ubuntu-24.04:
   arch: x86_64
   platform: linux
   free: false
 
-depot-ubuntu-22.04-arm-4:
+ubuntu-24.04-arm:
   arch: aarch64
   platform: linux
   free: false

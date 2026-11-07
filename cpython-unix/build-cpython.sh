@@ -271,6 +271,16 @@ if [ "${PYTHON_MAJMIN_VERSION}" = "3.15" ]; then
     patch -p1 -i "${ROOT}/patch-testinternalcapi-interpreter-extern.patch"
 fi
 
+# Free-threaded build: setting a function's __name__/__qualname__/__module__/__doc__
+# stopped the world since 3.14.7, making functools.wraps() from several threads
+# hundreds of times slower. Fixed on the 3.15 branch (gh-159136, merged 2026-10-29)
+# but not in a release before 3.15.3. Backport of
+# https://github.com/python/cpython/pull/159725 (docs and NEWS hunks dropped).
+# Remove when cpython-3.15 in downloads.json is >= 3.15.3.
+if [ "${PYTHON_MAJMIN_VERSION}" = "3.15" ]; then
+    patch -p1 -i "${ROOT}/patch-funcobject-attr-setters-no-stw-3.15.patch"
+fi
+
 # CPython uses HAVE_GETRANDOM_SYSCALL to decide whether to include
 # <sys/syscall.h>, but other APIs independently depend on __NR_* definitions
 # from that header. Include it whenever configure finds the header.

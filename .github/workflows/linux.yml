@@ -182,6 +182,7 @@ jobs:
             --labels "${STEPS_GET_LABELS_OUTPUTS_LABELS}" \
             --max-shards 2 \
             --event ${{ github.event_name }} \
+            --free-runners \
             ${{ (steps.check-pythonbuild.outputs.changed == 'true' || github.ref == 'refs/heads/main') && '--force-crate-build' || '' }} \
             > matrix.json
 
